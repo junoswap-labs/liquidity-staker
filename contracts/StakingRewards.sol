@@ -9,6 +9,7 @@ import "openzeppelin-solidity-2.3.0/contracts/utils/ReentrancyGuard.sol";
 // Inheritance
 import "./interfaces/IStakingRewards.sol";
 import "./RewardsDistributionRecipient.sol";
+import "./libraries/KAP20.sol";
 
 contract StakingRewards is IStakingRewards, RewardsDistributionRecipient, ReentrancyGuard {
     using SafeMath for uint256;
@@ -68,6 +69,12 @@ contract StakingRewards is IStakingRewards, RewardsDistributionRecipient, Reentr
 
     function earned(address account) public view returns (uint256) {
         return _balances[account].mul(rewardPerToken().sub(userRewardPerTokenPaid[account])).div(1e18).add(rewards[account]);
+    }
+
+    // allowance this contract holds to pull `account`'s staking tokens.
+    // reads ERC20 `allowance`, falls back to KAP-20 `allowances` (KUSDT & co).
+    function stakingAllowance(address account) external view returns (uint256) {
+        return KAP20.allowanceOf(address(stakingToken), account, address(this));
     }
 
     function getRewardForDuration() external view returns (uint256) {

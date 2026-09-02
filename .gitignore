@@ -1,2 +1,15 @@
 node_modules/
+
+# waffle
 build/
+
+# foundry
+out/
+cache/
+broadcast/
+lib/
+
+# secrets
+.env
+.env.*
+!.env.example
