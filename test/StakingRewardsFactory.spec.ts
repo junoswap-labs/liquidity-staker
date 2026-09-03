@@ -9,6 +9,9 @@ import StakingRewards from '../build/StakingRewards.json'
 
 chai.use(solidity)
 
+// ganache-core mis-estimates gas after a reward-bearing settle; see Regressions.spec.ts
+const GAS = { gasLimit: 8_000_000 }
+
 const LOCK = 7 * 24 * 60 * 60 // 7 days, in seconds
 
 describe('StakingRewardsFactory', () => {
@@ -488,7 +491,7 @@ describe('StakingRewardsFactory', () => {
       const unlock = Number((await pool.getUserInfoByIndex(wallet.address, 1)).unlockAt)
       await mineBlock(provider, unlock + 1)
 
-      await pool.withdraw(each.add(each.div(2)))
+      await pool.withdraw(each.add(each.div(2)), GAS)
       const lots = await pool.getUserInfos(wallet.address)
       expect(lots[0].amount).to.eq(0)
       expect(lots[1].amount).to.eq(each.div(2))

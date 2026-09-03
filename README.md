@@ -185,6 +185,34 @@ Informational findings; all but two are fixed, each with a regression test in
   `startEpoch`, with every narrowed field bounded by an explicit `require` first. The accumulator
   and withdrawal paths were de-duplicated (see the reuse notes above).
 
+### Can `withdraw` ever revert?
+
+Asked directly, and tested rather than assumed (`test/WithdrawLiveness.spec.ts`).
+
+**Nothing inside the pool can block it.** Not the creator, not the factory owner, not a closed
+pool, not an ended epoch, not a full deposit-lot array, and not a broken reward token —
+`withdraw` never touches `rewardsToken`, and `notifyRewardAmount` bounds the accumulator so the
+accrual settle cannot revert either. A locked lot never blocks an unlocked one behind it, and
+asking for more than is unlocked is a refusal, not a freeze.
+
+That last property was not free. Finding H-04 in the report: the accumulator had no upper bound,
+and overflowing it made `updateReward` revert on **every** path, including withdrawal —
+stakers' principal frozen permanently, no override, no recovery. Reproduced with a 2e41 budget
+accruing against a 1 wei stake, then closed by checking an epoch's worst-case growth at the
+moment it is configured.
+
+**Two things outside the pool still can**, and no code here can prevent either:
+
+- The staking token. Paused, blacklisting the pool, switched to KYC-only transfers (a contract
+  cannot be KYC'd), or drained by `adminTransfer` — any of these freezes withdrawals for as long
+  as it lasts. This is H-03, disclosed rather than mitigated.
+- A staking token that starts charging the **sender** a fee on top of the amount. Inbound fees
+  are handled (the pool credits what it received); an outbound fee charged on top is not, because
+  the pool holds exactly what it owes. The last withdrawal is then short. Out of scope by design.
+
+A front end should offer `withdraw` and `getReward` as separate actions, not only `exit` — a
+broken reward token stops `exit` but never `withdraw` (I-05).
+
 This is a self-audit, not a third-party one. It is a starting point for a real engagement, not a
 substitute for it.
 

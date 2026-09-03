@@ -327,9 +327,14 @@ contract StakingRewards is IStakingRewards, RewardsDistributionRecipient, Reentr
 
     /// @notice Withdraw staked tokens, taken from the caller's unlocked lots, oldest first.
     /// @dev Reverts with "Still locked" when the unlocked lots do not add up to `amount`; use
-    /// {withdrawableOf} to see what is available. Rewards are untouched by withdrawing; claim
-    /// them with {getReward}. There is no emergency exit that skips the lock, by design: the
-    /// lock is what stakers were promised.
+    /// {withdrawableOf} to see what is available. There is no emergency exit that skips the
+    /// lock, by design: the lock is what stakers were promised.
+    /// This function deliberately never touches {rewardsToken}, and {notifyRewardAmount} bounds
+    /// the accumulator so the settle in {updateReward} cannot overflow. So a broken reward token
+    /// - paused, blacklisting, KYC gated - stops {getReward} and {exit} but never this: the
+    /// principal always has a way out that does not depend on the reward side. The one thing
+    /// that can still block it is {stakingToken} itself, which no code here can prevent; see
+    /// audit H-03.
     function withdraw(uint256 amount) external nonReentrant updateReward(msg.sender) {
         require(amount > 0, "Cannot withdraw 0");
         require(_take(msg.sender, amount) == amount, "Still locked");
@@ -517,6 +522,18 @@ contract StakingRewards is IStakingRewards, RewardsDistributionRecipient, Reentr
         rewardsDuration = uint32(_rewardsDuration);
         lockDuration = uint32(_lockDuration);
         maxStakingPower = uint128(_maxStakingPower);
+
+        // Bound the accumulator so it can never overflow, whatever happens to the staked
+        // supply. rewardPerTokenStored grows by mulDiv(dt, rate, supply) and supply can legally
+        // be as low as 1 wei, so this epoch's worst case growth is reward * PRECISION. Checking
+        // it here means rewardPerToken() can never revert, and therefore neither can the
+        // withdrawal path, which is the property that actually matters: a staker's principal
+        // must never be trapped by reward arithmetic. Verified in test/WithdrawLiveness.spec.ts.
+        require(reward <= type(uint128).max, "Reward too large");
+        require(
+            rewardPerTokenStored <= type(uint256).max - reward * PRECISION,
+            "Reward exceeds accumulator headroom"
+        );
 
         uint256 rate = Math.mulDiv(reward, PRECISION, _rewardsDuration);
         require(rate > 0, "Reward rate is zero");

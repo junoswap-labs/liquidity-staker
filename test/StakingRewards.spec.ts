@@ -43,7 +43,7 @@ describe('StakingRewards', () => {
       0,
     ])
     const receipt = await provider.getTransactionReceipt(stakingRewards.deployTransaction.hash)
-    expect(receipt.gasUsed).to.eq('3055982')
+    expect(receipt.gasUsed).to.eq('3112271')
   })
 
   it('rewardsDuration', async () => {
