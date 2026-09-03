@@ -36,9 +36,14 @@ describe('StakingRewards', () => {
       wallet.address,
       rewardsToken.address,
       stakingToken.address,
+      wallet.address,
+      0,
+      REWARDS_DURATION,
+      0,
+      0,
     ])
     const receipt = await provider.getTransactionReceipt(stakingRewards.deployTransaction.hash)
-    expect(receipt.gasUsed).to.eq('1616332')
+    expect(receipt.gasUsed).to.eq('3055982')
   })
 
   it('rewardsDuration', async () => {
@@ -51,10 +56,10 @@ describe('StakingRewards', () => {
     // send reward to the contract
     await rewardsToken.transfer(stakingRewards.address, reward)
     // must be called by rewardsDistribution
-    await stakingRewards.notifyRewardAmount(reward)
+    await stakingRewards.notifyRewardAmount(reward, 0, REWARDS_DURATION, 0, 0)
 
-    const startTime: BigNumber = await stakingRewards.lastUpdateTime()
-    const endTime: BigNumber = await stakingRewards.periodFinish()
+    const startTime = BigNumber.from(await stakingRewards.lastUpdateTime())
+    const endTime = BigNumber.from(await stakingRewards.periodFinish())
     expect(endTime).to.be.eq(startTime.add(REWARDS_DURATION))
     return { startTime, endTime }
   }
@@ -73,12 +78,13 @@ describe('StakingRewards', () => {
 
     // unstake
     await stakingRewards.connect(staker).exit()
-    const stakeEndTime: BigNumber = await stakingRewards.lastUpdateTime()
+    const stakeEndTime = BigNumber.from(await stakingRewards.lastUpdateTime())
     expect(stakeEndTime).to.be.eq(endTime)
 
     const rewardAmount = await rewardsToken.balanceOf(staker.address)
     expect(reward.sub(rewardAmount).lte(reward.div(10000))).to.be.true // ensure result is within .01%
-    expect(rewardAmount).to.be.eq(reward.div(REWARDS_DURATION).mul(REWARDS_DURATION))
+    // dust only: rewardRate is scaled by 1e36, so the truncation is a few wei, not seconds worth
+    expect(reward.sub(rewardAmount)).to.be.lte(1000)
   })
 
   it('stakeWithPermit', async () => {
@@ -106,12 +112,13 @@ describe('StakingRewards', () => {
 
     // unstake
     await stakingRewards.connect(staker).exit()
-    const stakeEndTime: BigNumber = await stakingRewards.lastUpdateTime()
+    const stakeEndTime = BigNumber.from(await stakingRewards.lastUpdateTime())
     expect(stakeEndTime).to.be.eq(endTime)
 
     const rewardAmount = await rewardsToken.balanceOf(staker.address)
     expect(reward.sub(rewardAmount).lte(reward.div(10000))).to.be.true // ensure result is within .01%
-    expect(rewardAmount).to.be.eq(reward.div(REWARDS_DURATION).mul(REWARDS_DURATION))
+    // dust only: rewardRate is scaled by 1e36, so the truncation is a few wei, not seconds worth
+    expect(reward.sub(rewardAmount)).to.be.lte(1000)
   })
 
   it('notifyRewardAmount: ~half', async () => {
@@ -125,19 +132,19 @@ describe('StakingRewards', () => {
     await stakingToken.transfer(staker.address, stake)
     await stakingToken.connect(staker).approve(stakingRewards.address, stake)
     await stakingRewards.connect(staker).stake(stake)
-    const stakeStartTime: BigNumber = await stakingRewards.lastUpdateTime()
+    const stakeStartTime = BigNumber.from(await stakingRewards.lastUpdateTime())
 
     // fast-forward past the reward window
     await mineBlock(provider, endTime.add(1).toNumber())
 
     // unstake
     await stakingRewards.connect(staker).exit()
-    const stakeEndTime: BigNumber = await stakingRewards.lastUpdateTime()
+    const stakeEndTime = BigNumber.from(await stakingRewards.lastUpdateTime())
     expect(stakeEndTime).to.be.eq(endTime)
 
     const rewardAmount = await rewardsToken.balanceOf(staker.address)
     expect(reward.div(2).sub(rewardAmount).lte(reward.div(2).div(10000))).to.be.true // ensure result is within .01%
-    expect(rewardAmount).to.be.eq(reward.div(REWARDS_DURATION).mul(endTime.sub(stakeStartTime)))
+    expect(reward.mul(endTime.sub(stakeStartTime)).div(REWARDS_DURATION).sub(rewardAmount).abs()).to.be.lte(1000)
   }).retries(2) // TODO investigate flakiness
 
   it('notifyRewardAmount: two stakers', async () => {
@@ -162,7 +169,7 @@ describe('StakingRewards', () => {
 
     // unstake
     await stakingRewards.connect(staker).exit()
-    const stakeEndTime: BigNumber = await stakingRewards.lastUpdateTime()
+    const stakeEndTime = BigNumber.from(await stakingRewards.lastUpdateTime())
     expect(stakeEndTime).to.be.eq(endTime)
     await stakingRewards.connect(secondStaker).exit()
 

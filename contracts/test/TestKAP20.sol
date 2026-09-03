@@ -1,4 +1,5 @@
-pragma solidity ^0.5.16;
+// SPDX-License-Identifier: GPL-3.0-or-later
+pragma solidity =0.8.19;
 
 // minimal KAP-20 shape for tests: `allowances` getter, no ERC20 `allowance`
 contract TestKAP20 {

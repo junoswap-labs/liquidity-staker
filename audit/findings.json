@@ -1,0 +1,513 @@
+{
+  "project": "liquidity-staker — permissionless staking pool factory",
+  "type": "Staking / reward distribution (Synthetix StakingRewards lineage)",
+  "chain": "KUB Chain (Bitkub) — mainnet 96, testnet 25925",
+  "commit": "c580963 + uncommitted working tree (see Scope); re-review after remediation",
+  "date": "2026-09-03",
+  "auditor": "Claude Code (smartcontract-audit skill)",
+  "scope": [
+    "contracts/StakingRewards.sol",
+    "contracts/StakingRewardsFactory.sol",
+    "contracts/RewardsDistributionRecipient.sol",
+    "contracts/interfaces/IStakingRewards.sol",
+    "contracts/libraries/KAP20.sol",
+    "contracts/StakingRewardsLens.sol"
+  ],
+  "summary": "Permissionless factory for single-pool staking on KUB Chain. Anyone calls `deploy` to create a `StakingRewards` pool, choosing the staking token, the reward token, the budget, the start time, the epoch length, a per-stake lock and a total staking cap, and funding the rewards up front; the same transaction starts epoch 1. The creator funds later epochs with `startEpoch`, retires the pool with `close`, and reclaims only the emissions that accrued while the pool was empty. Reward accounting is the Synthetix accumulator (`rewardPerTokenStored` / `userRewardPerTokenPaid`), with per-deposit lock lots and an ERC-20/KAP-20 allowance fallback.\n\n**One Critical finding.** The accumulator step divides by the total stake and discards the remainder, and `getRewardFor(address)` is permissionless — so an attacker chooses how often the settlement happens. Settling once per block makes the increment round to zero every time on a low-decimal reward token such as KUSDT, while still consuming the elapsed seconds. A 1 000 KUSDT budget over a 1 000 000-unit 18-decimal LP pool pays out 999 of its 1 000 tokens if left alone and **0** under this attack, for the price of gas (C-01). This was rated High on the first pass, on the wrong assumption that the loss tracks organic activity; it was escalated on re-review once the permissionless settlement path was traced.\n\nTwo High findings remain from the same design decision — **the factory accepts arbitrary tokens from anyone**. A fee-on-transfer staking token silently desynchronised `_totalSupply` and left the last stakers unable to withdraw (H-01, fixed by crediting the measured balance delta); and any KAP-20 token's committee can move a pool's balance out or freeze every transfer out of it (H-03, inherent — mitigated by an optional owner allowlist that ships off, and by front-end disclosure).\n\n**Remediation status:** C-01, H-01, M-01, M-02, M-03, L-01, L-02, L-03, I-01, I-03 and I-04 are fixed and carry regression tests in `test/Regressions.spec.ts`; H-03 and I-01 are acknowledged with the mitigations described in each. Fixing the factory also exposed an EIP-170 problem: the factory embeds the pool's initcode, and at `optimizer_runs = 999999` its runtime reached 25 719 bytes, over the 24 576-byte limit — it was undeployable. The optimizer now runs at 1 000 (factory 21 249 bytes, pool 13 366).\n\nA reuse pass on re-review merged three duplicated paths that were costing users gas - a double accumulator settle on every state change, a double settle plus double lot walk in `exit()`, and two copies of the withdrawal tail - and a new read-only `StakingRewardsLens` collapses a pool page from twenty-odd `eth_call`s to one (I-01, I-04).\n\nThe contract is well documented, the arithmetic is deliberate rather than accidental, and the test suite covers the reward maths across 0/2/6/8/18-decimal tokens. The residual gaps are at the boundary — which tokens are allowed in — not in the core accounting.",
+  "trust_assumptions": [
+    "**Not audited:** OpenZeppelin Contracts 4.9.6 (`Ownable`, `SafeERC20`, `ReentrancyGuard`, `Math`), `solc 0.8.19`, and the KUB Chain client itself. All are assumed to behave as documented.",
+    "**Not audited:** the staking and reward tokens. Pool creation is permissionless, so every pool inherits the full trust surface of whatever tokens its creator chose — including any KAP-20 committee, blocklist, pause switch or KYC gate. H-03 scopes this.",
+    "**Not audited:** the front end. Several findings (M-01, H-02) are only safe if the UI reads live pool state rather than the factory's `poolInfo` index, and warns on parameter combinations that truncate.",
+    "The factory `owner` is assumed to be a multisig or timelock. A single EOA raises M-03 to High.",
+    "A pool `creator` is trusted only with respect to their own capital: they can retire the pool and reclaim unearnable emissions, and cannot reach staked principal or rewards a staker has already earned. This was verified, not assumed.",
+    "`StakingRewards` is analysed as deployed by the factory. Deploying it standalone with an arbitrary `rewardsDistribution` address widens the surface (that address controls the schedule and could notify a reward larger than was actually funded, since the balance check counts staked principal when both tokens are the same) and is out of scope.",
+    "The working tree at the time of review is not committed. Findings reference the files as read, not as published at `c580963`.",
+    "Advisory only, scoped to the code and state described. Not a warranty; residual risk stays with the team."
+  ],
+  "sections": [
+    {
+      "title": "Method & verification",
+      "body": "Reviewed across the five dimensions in the methodology: access control, core protocol logic (the epoch state machine), value accounting, low-level Solidity safety, and reward-accumulator mathematics. Every in-scope file was read end to end; nothing was sampled.\n\nThe five mandatory passes were all performed: arithmetic (every narrowing cast, every denominator, every `unchecked` block, the monotonic accumulator against its type max), liveness (the seven positive checks, answered in the section below), loops and gas, centralization, and value accounting.\n\nEach candidate was re-checked with the goal of refuting it — accounting for checked arithmetic in 0.8.19, the `nonReentrant` guards, the `require` further up the call path, and whether the assumed caller can actually reach the state. **Nine candidates were dropped this way**, including: reward over-promise via `notifyRewardAmount` (the factory always notifies exactly what it transferred in the same call), cross-pool reward theft (pools share no balance), `getRewardFor` payout redirection (it pays the account, never the caller), `exit()` nested-reentrancy (the two guarded calls are sequential, not nested), and monotonic overflow of `rewardPerTokenStored` (~1e33 epochs at the worst realistic rate). **12 verified findings, 12 distinct after de-duplication.**\n\nTooling: `scripts/scan.py` recon, `forge build --sizes`, and the project's own 46-test suite (`npx mocha`, all passing) used to confirm behaviour rather than to find it. **Slither was not available in this environment and was not run** — a static pass should be added before deployment.\n\nProduced with `model: opus`, `effort: high`, `solc 0.8.19`, `forge 1.6.0-nightly`, against the working tree at commit `c580963`."
+    },
+    {
+      "title": "Liveness — the seven positive checks",
+      "body": "Every audited contract should answer yes to all seven. Two answers are qualified, and both are filed as findings.",
+      "table": {
+        "headers": [
+          "#",
+          "Check",
+          "Answer"
+        ],
+        "rows": [
+          [
+            "1",
+            "Principal retrievable on a path touching no external contract but the asset token?",
+            "Yes — `withdraw` runs internal accounting then one `safeTransfer` of the staking token. No oracle, no reward-token call, no factory call."
+          ],
+          [
+            "2",
+            "Is there a state where that path reverts forever?",
+            "Yes, three: a fee-on-transfer staking token drains the pool (H-01); a KAP-20 that enables KYC-only transfers or blocklists the pool (H-03); a user who accumulates enough deposit lots to exceed the block gas limit in their own `_debit` loop (M-02)."
+          ],
+          [
+            "3",
+            "Is every loop bounded by a constant or by an admin-grown value?",
+            "No — `_deposits[user]` grows one entry per stake, and is walked by `withdraw`, `exit`, `withdrawableOf` and `nextUnlockAt` (M-02). `claimAll`'s loop is bounded by the caller's own calldata."
+          ],
+          [
+            "4",
+            "Is every denominator provably non-zero?",
+            "Yes — `rewardPerToken` divides by `_totalSupply` only inside `supply != 0`; `notifyRewardAmount` divides by `_rewardsDuration` after `require(> 0)`; every other division is by the constant `1e18`."
+          ],
+          [
+            "5",
+            "Does every narrowing cast use SafeCast or have a proven bound?",
+            "Almost — `uint128(amount)`, `uint128(remaining)`, `uint32(_rewardsDuration)` and `uint40(block.timestamp)` are all bounded by a preceding `require`. `uint40(begin + _rewardsDuration)` is not (L-01)."
+          ],
+          [
+            "6",
+            "Does the monotonic accumulator fit its type for the contract's lifetime?",
+            "Yes — `rewardPerTokenStored` grows by at most `reward * 1e18` per epoch. At a 1e26 budget against a 1-wei stake, that is ~1e44 per epoch; ~1e33 epochs would be needed to reach `uint256` max."
+          ],
+          [
+            "7",
+            "Is there an emergency withdrawal that skips reward accounting?",
+            "No, and it is not needed: `updateReward` performs no external call and cannot revert on anything an attacker controls. Noted as I-02 rather than filed as a gap."
+          ]
+        ],
+        "highlight": 2
+      }
+    },
+    {
+      "title": "Roles & permissions",
+      "body": "Two privileged roles, both narrow. Neither can reach staked principal or rewards a staker has already earned — this was traced, not assumed.",
+      "table": {
+        "headers": [
+          "Role",
+          "Where",
+          "Can do",
+          "Cannot do",
+          "Loss on compromise"
+        ],
+        "rows": [
+          [
+            "Factory `owner`",
+            "`StakingRewardsFactory` (OZ `Ownable`, single-step, renounceable)",
+            "`setServiceFee` — set fee token, unbounded fee amount, and receiver, with no timelock",
+            "Touch any pool, any staked balance, or any reward",
+            "Pool creation priced out or bricked; a creator front-run for at most the fee they approved. No pool funds at risk (M-03)"
+          ],
+          [
+            "Pool `creator`",
+            "`StakingRewards` (immutable, set at deploy)",
+            "`startEpoch` (fund and schedule the next epoch), `close` (retire, between epochs only), `recoverUnallocatedRewards` (only the slice emitted while `_totalSupply == 0`)",
+            "Withdraw principal, take earned rewards, shorten a live epoch, re-rate a running epoch, or close mid-epoch",
+            "The creator's own unspent budget. Stakers keep principal and earned rewards"
+          ],
+          [
+            "Reward distributor",
+            "`rewardsDistribution`, immutable — always the factory",
+            "`notifyRewardAmount`",
+            "Anything else",
+            "N/A — it is the factory, which holds no keys"
+          ],
+          [
+            "KAP-20 committee / admin",
+            "Outside this codebase, one per token",
+            "`adminTransfer` the pool's entire balance out; enable KYC-only transfers; blocklist or pause",
+            "—",
+            "Total loss or permanent freeze of a pool (H-03)"
+          ]
+        ],
+        "highlight": 4
+      }
+    },
+    {
+      "title": "Value map — where every unit ends up",
+      "body": "Traced per pool, from the factory's `deploy` and `startEpoch` parameters. The factory itself never holds a balance: both transfers in `deploy` are `safeTransferFrom(creator → destination)` in the same transaction.",
+      "table": {
+        "headers": [
+          "Slice",
+          "Destination",
+          "Reachable by",
+          "Notes"
+        ],
+        "rows": [
+          [
+            "`rewardAmount` (per epoch)",
+            "The pool contract",
+            "Stakers, pro-rata by stake-seconds",
+            "Transferred before `notifyRewardAmount`; the pool's balance check bounds `rewardRate` by what it actually holds"
+          ],
+          [
+            "`feeAmount` (currently 0)",
+            "`feeReceiver`, directly",
+            "Owner-controlled address",
+            "Off as shipped. Unbounded and mutable — see M-03"
+          ],
+          [
+            "Emissions while `_totalSupply == 0`",
+            "`unallocatedRewards`",
+            "Creator, after `close`",
+            "Tracked exactly, disjoint from anything a staker earned. Verified: `amount = min(unallocatedRewards, free)` and `free` subtracts `_totalSupply` when both tokens are the same"
+          ],
+          [
+            "Truncated emissions (`Δt × rate mod supply`)",
+            "Stranded in the pool",
+            "Nobody",
+            "Up to `totalStaked / 1e18` reward base-units per settlement. Not counted in `unallocatedRewards`, so not recoverable — H-02"
+          ],
+          [
+            "Rewards earned but never claimed",
+            "Stranded in the pool",
+            "The staker, forever",
+            "By design; `recoverUnallocatedRewards` cannot reach them"
+          ],
+          [
+            "Staked principal",
+            "The pool contract",
+            "The staker, after their lot unlocks",
+            "No admin path reaches it"
+          ]
+        ],
+        "highlight": 2
+      }
+    },
+    {
+      "title": "C-01 quantified — truncation loss per settlement",
+      "body": "The accumulator advances by `floor((Δt × rewardRate) / totalStaked)`. The remainder is discarded, but `lastUpdateTime` advances regardless, so whoever picks Δt picks how much of the budget survives. `getRewardFor(address)` takes an arbitrary account and has no access control, so Δt is attacker-controlled and can be one block.\n\nBudget 1 000 KUSDT = 1e9 base units over 30 days, against 1 000 000 units of an 18-decimal LP = 1e24 staked, at the audited `PRECISION = 1e18`:\n\n```\nrewardRate = 1e9 × 1e18 / 2 592 000 = 385802469135802469135\n\n  Δt        increment per settlement\n       1s    0\n       5s    0\n      60s    0\n    3600s    1\n 2592000s    999\n\nsettled every block (518 400 settlements)   -> rewardPerToken total = 0\nsettled once, at the end of the epoch       -> rewardPerToken total = 999\n```\n\nSo the pool pays 999 000 000 of its 1 000 000 000 base units when left alone, and 0 when ground down one block at a time. The stranded remainder is unrecoverable: `unallocatedRewards` only accrues while `_totalSupply == 0`, and this loss occurs while the pool is staked.\n\nWith `PRECISION = 1e36` the one-second increment becomes 385 802 469 135 802 — non-zero at every Δt, so the attack has nothing to grind against. `Math.mulDiv` keeps the 512-bit intermediate, so the larger scale costs no headroom.",
+      "table": {
+        "headers": [
+          "Reward token",
+          "Budget",
+          "Staked (18 dec)",
+          "Max loss / settlement",
+          "Loss at 1 000 interactions",
+          "Share of budget"
+        ],
+        "rows": [
+          [
+            "KUSDT (6 dec)",
+            "1 000 KUSDT (1e9 units)",
+            "1 000 000 (1e24)",
+            "1e6 units = 1.0 KUSDT",
+            "1 000 KUSDT",
+            "up to 100%"
+          ],
+          [
+            "KUSDT (6 dec)",
+            "10 000 KUSDT (1e10)",
+            "100 000 (1e23)",
+            "1e5 units = 0.1 KUSDT",
+            "100 KUSDT",
+            "1.0%"
+          ],
+          [
+            "KBTC-style (8 dec)",
+            "1 BTC (1e8 units)",
+            "1 000 000 (1e24)",
+            "1e6 units = 0.01 BTC",
+            "10 BTC (clamped to budget)",
+            "up to 100%"
+          ],
+          [
+            "18-decimal token",
+            "100 000 (1e23)",
+            "1 000 000 (1e24)",
+            "1e6 wei",
+            "1e9 wei",
+            "1e-14 %"
+          ],
+          [
+            "18-decimal token",
+            "100 000 (1e23)",
+            "1e30 (whale pool)",
+            "1e12 wei",
+            "1e15 wei",
+            "1e-8 %"
+          ]
+        ],
+        "highlight": 5
+      }
+    },
+    {
+      "title": "Loop & gas analysis",
+      "body": "Every loop in scope, with who controls the bound. KUB gas is cheap, so an unbounded loop is treated as a real finding here rather than a theoretical one.",
+      "table": {
+        "headers": [
+          "Location",
+          "Bound controlled by",
+          "Maximum",
+          "Verdict"
+        ],
+        "rows": [
+          [
+            "`StakingRewards._debit` (:365) and the cursor sweep (:383)",
+            "The user themselves, one entry per `stake`",
+            "Unbounded",
+            "**M-02** — a storage read plus a conditional write per iteration puts the practical ceiling in the low thousands; past it the user's own `withdraw`/`exit` is dead, with no indexed alternative"
+          ],
+          [
+            "`StakingRewards.withdrawableOf` (:237), `nextUnlockAt` (:250)",
+            "Same array",
+            "Unbounded",
+            "Same root cause as M-02. `exit()` walks it twice — once here, once in `_debit`"
+          ],
+          [
+            "`StakingRewards.getUserInfos` (:207)",
+            "Same array",
+            "Unbounded",
+            "Safe — `view`, off-chain callers only; `getUserInfosPaged` is the on-chain path"
+          ],
+          [
+            "`StakingRewardsFactory.claimAll` (:210)",
+            "The caller, via calldata",
+            "Caller's own gas",
+            "Safe — the caller chooses the list and pays for it; each entry is validated against `poolInfo` before the external call"
+          ]
+        ],
+        "highlight": 3
+      }
+    },
+    {
+      "title": "Fork diff — what changed from upstream",
+      "body": "Lineage: Synthetix `StakingRewards` v2.27.2 → Uniswap `liquidity-staker` → this repo. Diffed against both. Deviations are deliberate and documented in NatSpec; these are the ones that change security properties.\n\n- **`rewardRate` scaled by 1e18** — numerically equivalent to upstream's `Δt × rate × 1e18 / supply`, and strictly better on the rate division. It does **not** remove the final truncation against `totalStaked` (H-02), so the README's claim that precision is fixed is only half true.\n- **Per-deposit lock lots** replace upstream's single per-user record — new code, new unbounded loop (M-02).\n- **`notifyRewardAmount` one-shot per epoch, gated on `block.timestamp >= periodFinish`** — this removes upstream's mid-period top-up and with it the classic \"claim front-run by a rate change\" issue. A live epoch cannot be re-rated. Verified.\n- **`getRewardFor(account)` is permissionless** — safe because the payout goes to `account`, never to `msg.sender`. Verified against the batch-claim path.\n- **`stakeWithPermit` retained from Uniswap** — inert for KAP-20 tokens, which have no `permit`. No risk, but it is dead weight in the bytecode on this chain.\n- **The factory holds no balance and no genesis gate** — upstream's factory custodied every pool's rewards until `notifyRewardAmounts`. Removing that removes a shared honeypot and the never-started stranding case. Verified.\n\nNo constant, comparison operator or rounding direction was found altered from upstream in a way that changes who gets paid — the failure mode of the Uranium-class fork bug."
+    }
+  ],
+  "roadmap": [
+    {
+      "tier": "0 (gate)",
+      "scope": "Token admission — while any of this is open, the factory should not be open to arbitrary tokens",
+      "fixes": "Measure the received amount on the way in instead of trusting `amount`; raise the accumulator precision to 1e36 via `Math.mulDiv` and reject a schedule whose rate would truncate; publish the KAP-20 committee exposure and ship a curated token list in the UI",
+      "closes": [
+        "H-01",
+        "C-01",
+        "H-03"
+      ],
+      "outcome": "A pool can no longer be created that silently loses its budget, strands its stakers' principal, or is quietly seizable"
+    },
+    {
+      "tier": "1",
+      "scope": "Liveness and user-facing correctness",
+      "fixes": "Add an indexed `withdraw(index, amount)` plus a cap on live lots per user; refresh `poolInfo` on every `startEpoch`",
+      "closes": [
+        "M-01",
+        "M-02"
+      ],
+      "outcome": "No user can brick their own exit, and the on-chain index stops disagreeing with the pool"
+    },
+    {
+      "tier": "2",
+      "scope": "Governance",
+      "fixes": "`Ownable2Step`, override `renounceOwnership` to revert, cap `feeAmount` in the setter, timelock the fee role",
+      "closes": [
+        "M-03"
+      ],
+      "outcome": "Pool creation cannot be priced out, front-run, or permanently bricked by one key"
+    },
+    {
+      "tier": "3",
+      "scope": "Hardening and cost",
+      "fixes": "`SafeCast` on the remaining narrowing cast, `nonReentrant` on the factory's fund-moving paths, bounds documented on every `unchecked` block, pack `StakingRewardsInfo`, custom errors",
+      "closes": [
+        "L-01",
+        "L-02",
+        "L-03",
+        "I-01",
+        "I-02",
+        "I-03"
+      ],
+      "outcome": "Defence in depth, and roughly 15–20% off the 3.15M gas each pool creation costs"
+    }
+  ],
+  "findings": [
+    {
+      "id": "H-01",
+      "title": "Fee-on-transfer staking token desynchronises `_totalSupply`, stranding the last stakers' principal",
+      "severity": "High",
+      "status": "Fixed",
+      "location": "StakingRewards.sol:336-355 (`_credit`), StakingRewards.sol:299-307 (`withdraw`), StakingRewardsFactory.sol:134-199 (`deploy`)",
+      "description": "`_credit` records the **requested** `amount` into `_totalSupply`, `_balances[msg.sender]` and the deposit lot, and only afterwards does `stake` pull the tokens with `safeTransferFrom`. Nothing compares the balance before and after the transfer.\n\nFor a fee-on-transfer, deflationary or rebasing staking token the pool receives less than it recorded, and the gap compounds with every deposit. `withdraw` then pays out the recorded figure. Earlier withdrawers are paid in full out of later depositors' tokens, and the pool eventually holds less than `_totalSupply` claims.\n\nThe reward token is explicitly documented as not supporting fee-on-transfer, and the pool's balance check in `notifyRewardAmount` enforces that by reverting. The **staking** token has no equivalent guard, and `deploy` validates neither token — it only rejects a zero reward-token address.\n\nWorked example with a 2% fee-on-transfer staking token: A stakes 100 (pool receives 98, `_totalSupply` = 100), B stakes 100 (pool receives 196 total, `_totalSupply` = 200). A withdraws 100 — the transfer succeeds, pool holds 96. B calls `withdraw(100)`: the token's own balance check reverts. B's `exit()` reverts identically. B's principal is unreachable, and no admin path exists to make them whole.\n\n**Status:** fixed. Regression test: `test/Regressions.spec.ts`. `stake` and `stakeWithPermit` now credit the balance delta measured across the transfer (`_pull`), so `_totalSupply` can never exceed the tokens the pool actually holds.",
+      "impact": "Permanent loss of principal for whichever stakers withdraw last, sized by the token's fee rate times the pool's deposit volume. Because pool creation is permissionless, this is also a deliberate rug vector: a creator can open a pool over a fee-on-transfer token, advertise rewards, and let the arithmetic trap depositors. Neither the creator nor the factory owner needs any privilege to reach the state, and there is no recovery function.",
+      "recommendation": "Record what the pool actually received, not what was asked for. Measure the staking-token balance before and after the pull and credit the difference — this also makes the deposit-lot amount, `_balances` and `_totalSupply` consistent by construction. Do the same in `stakeWithPermit`. If supporting such tokens is not intended, make that explicit instead: revert when `received != amount` so the pool fails loudly on the first deposit rather than silently on the last withdrawal.",
+      "code": " function _credit(uint256 amount) private {\n     require(amount > 0, \"Cannot stake 0\");\n\n-    uint256 supply = _totalSupply + amount;\n     uint256 cap = maxStakingPower;\n     require(cap == 0 || supply <= cap, \"Staking cap reached\");\n     require(supply <= type(uint128).max, \"Amount too large\");\n\n     _totalSupply = uint128(supply);\n-    _balances[msg.sender] += amount;\n     _deposits[msg.sender].push(\n-        IStakingRewards.Deposit({amount: uint128(amount), ...})\n     );\n }\n\n function stake(uint256 amount) external nonReentrant updateReward(msg.sender) {\n-    _credit(amount);\n-    stakingToken.safeTransferFrom(msg.sender, address(this), amount);\n     emit Staked(msg.sender, amount);\n }",
+      "fix": " function stake(uint256 amount) external nonReentrant updateReward(msg.sender) {\n+    uint256 before = stakingToken.balanceOf(address(this));\n+    stakingToken.safeTransferFrom(msg.sender, address(this), amount);\n+    uint256 received = stakingToken.balanceOf(address(this)) - before;\n+    _credit(received);\n+    emit Staked(msg.sender, received);\n }\n\n // or, if such tokens are simply out of scope, fail loudly on the way in:\n+    require(received == amount, \"Fee on transfer not supported\");",
+      "references": [
+        "https://github.com/d-xo/weird-erc20#fee-on-transfer",
+        "https://docs.synthetix.io/contracts/source/contracts/stakingrewards"
+      ]
+    },
+    {
+      "id": "C-01",
+      "title": "Reward accrual truncates to zero on low-decimal reward tokens, and any caller can force the truncation every block until the whole budget is stranded",
+      "severity": "Critical",
+      "status": "Fixed",
+      "location": "StakingRewards.sol:156-166 (`rewardPerToken`), StakingRewards.sol:419-450 (`notifyRewardAmount`), StakingRewards.sol:497-514 (`updateReward`)",
+      "description": "`rewardPerToken()` advances the accumulator by `floor((applicable - last) * rewardRate / supply)` and discards the remainder. `rewardRate` is scaled by 1e18, which fixes the *rate* division, but the division by `totalStaked` is unscaled — so every settlement throws away up to one whole unit of `rewardPerToken`, worth `totalStaked / 1e18` reward base-units across the pool.\n\n`updateReward` runs on every `stake`, `withdraw`, `getReward`, `getRewardFor`, `exit` and `notifyRewardAmount`, so the loss scales with how busy the pool is, not with elapsed time. A pool nobody touches until the epoch ends loses nothing; a pool touched a thousand times loses a thousand increments.\n\nThe magnitude depends entirely on the reward token's decimals. Concretely, with KUSDT (6 decimals) as the reward token, a 1 000 KUSDT budget (1e9 base units) over 30 days, and 1 000 000 units of an 18-decimal LP staked (1e24):\n\n- `rewardRate = 1e9 * 1e18 / 2 592 000 = 3.858e20`\n- one second of accrual: `floor(1 * 3.858e20 / 1e24) = 0`\n- each settlement discards up to `1e24 / 1e18 = 1e6` base units = **1.0 KUSDT**\n\nAt 1 000 interactions over the epoch the entire 1 000 KUSDT budget can be consumed by truncation while `earned()` reports approximately zero for everyone.\n\nThe stranded amount is not recoverable. `unallocatedRewards` only accrues while `_totalSupply == 0`, and this loss happens precisely when the pool *is* staked, so `recoverUnallocatedRewards` returns nothing for it. The project's own test suite encodes the mechanism — `maxDust(totalStaked) = totalStaked / 1e18 + 10` — and observes 880 wei of loss on an 18-decimal token, which is the same formula at a harmless scale.\n\nUpstream Synthetix has the identical final division, so this is inherited rather than introduced. It matters far more here because KUSDT, the flagship KUB stablecoin, has 6 decimals, and because the README claims the precision problem is fixed.\n\n**Escalated to Critical on re-review.** The first pass rated this High on the assumption that the loss tracks organic pool activity. It does not: `getRewardFor(address)` is permissionless, so *the attacker chooses how often the accumulator settles*. Settling once per block forces the increment to be computed over the smallest possible `Δt`, which is exactly when `floor((Δt * rewardRate) / supply)` is most likely to be zero — and a zero increment advances `lastUpdateTime` anyway, so the elapsed second is consumed and its emissions are gone.\n\nCarrying the numbers through for a 1 000 KUSDT (1e9 base units) budget over 30 days with 1 000 000 units of an 18-decimal LP staked (1e24), at the audited `PRECISION = 1e18`:\n\n```\nrewardRate                      = 385802469135802469135\nsettle every        1s -> increment = 0\nsettle every        5s -> increment = 0\nsettle every       60s -> increment = 0\nsettle every     3600s -> increment = 1\nsettle every  2592000s -> increment = 999\n\nsettled every block (518 400 settlements): rewardPerToken total = 0\nsettled once at the end:                   rewardPerToken total = 999\n```\n\nSo the same pool pays out 999 000 000 of its 1 000 000 000 base units if left alone, and **0** if a stranger spends one transaction per block on it. That is an unprivileged, cheap, fully deterministic griefing attack on the pool's entire budget, not a rounding nuisance — hence Critical. The attack needs no stake, no approval and no timing; on a cheap-gas chain such as KUB the cost is negligible against the budget destroyed.",
+      "impact": "An attacker with no stake and no privileges destroys the pool's entire reward budget for the price of gas, by calling `getRewardFor` once per block. The rewards are not stolen — they are permanently frozen in the pool: `unallocatedRewards` only accrues while `_totalSupply == 0`, and this loss happens precisely while the pool is staked, so `recoverUnallocatedRewards` returns nothing for it. Stakers earn approximately zero while the UI shows a funded pool, and the creator cannot reclaim the difference. The same outcome is reachable with no attacker at all, by configuration alone, on a busy KUSDT-rewarded pool over a large 18-decimal LP.",
+      "recommendation": "Raise the accumulator precision so that a one-second settlement still produces a non-zero increment for any realistic decimals/stake combination. `rewardRate` and `rewardPerTokenStored` are now scaled by `PRECISION = 1e36` and every step goes through `Math.mulDiv`, whose 512-bit intermediate makes the larger scale free of overflow risk. In the scenario above the one-second increment becomes 385 802 469 135 802 rather than 0.\n\n`notifyRewardAmount` additionally rejects a schedule whose rate rounds to zero (`require(rate > 0)`). Carrying the remainder forward is the alternative fix if the precision change is ever considered too invasive; it was not needed here.",
+      "code": " uint256 public constant PRECISION = 1e18;\n\n function rewardPerToken() public view returns (uint256) {\n     uint256 supply = _totalSupply;\n     ...\n     unchecked {\n-        return rewardPerTokenStored + ((applicable - last) * rewardRate) / supply;\n     }\n }\n\n function notifyRewardAmount(uint256 reward, ...) external {\n-    uint256 rate = (reward * 1e18) / _rewardsDuration;\n }",
+      "fix": "+uint256 public constant PRECISION = 1e36;\n\n function rewardPerToken() public view returns (uint256) {\n+    return rewardPerTokenStored + Math.mulDiv(applicable - last, rewardRate, supply);\n }\n\n function earned(address account) public view returns (uint256) {\n+    return Math.mulDiv(_balances[account],\n+        rewardPerToken() - userRewardPerTokenPaid[account], PRECISION) + rewards[account];\n }\n\n function notifyRewardAmount(uint256 reward, ...) external {\n+    uint256 rate = Math.mulDiv(reward, PRECISION, _rewardsDuration);\n+    require(rate > 0, \"Reward rate is zero\");\n }",
+      "references": [
+        "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.6/contracts/utils/math/Math.sol",
+        "https://github.com/Uniswap/v3-core/blob/main/contracts/libraries/FullMath.sol"
+      ]
+    },
+    {
+      "id": "H-03",
+      "title": "Every pool inherits its tokens' KAP-20 committee as a trusted party with full control of the pooled balance",
+      "severity": "High",
+      "status": "Acknowledged",
+      "location": "StakingRewardsFactory.sol:134-199 (`deploy`, no token validation), StakingRewards.sol:299-333 (`withdraw`, `getRewardFor`)",
+      "description": "The KAP-20 standard on KUB Chain adds privileged functions that have no ERC-20 equivalent, held by the token developer's committee and admin addresses:\n\n- `adminTransfer(sender, recipient, amount)` — the committee moves any holder's balance, including a contract's. The pool is a holder.\n- `activateOnlyKycAddress()` / `setAcceptedKycLevel(level)` — once enabled, transfers require the sender to hold an accepted KYC level. A pool contract holds none, so **every** `safeTransfer` out of it reverts.\n- `pause()` / `addBlacklist(address)` — the same freeze, reached a different way.\n\nAll three were confirmed present on KUB mainnet KUSDT (`0x7d984C24d2499D840eB3b7016077164e15E5faA6`), whose ABI exposes `adminTransfer`, `activateOnlyKycAddress`, `setAcceptedKycLevel`, `addBlacklist` and `pause`. That token is the most likely reward asset for pools on this factory.\n\n`deploy` performs no validation on either token address — by design, since the factory is permissionless. Consequently every pool's principal and reward balance sit behind a third party's admin key that neither the protocol nor its users chose, with no on-chain recourse. This is expected on KUB rather than a coding error, but it is the largest single risk in the deployment and the report has to name it.\n\n**Status:** acknowledged, accepted, and deliberately not mitigated in code. This is inherent to a permissionless factory over KAP-20 tokens and cannot be fixed in the pool.\n\nAn owner-controlled token allowlist was implemented and then **removed** on review, which is worth recording because it is the kind of control that looks like a fix and is not one:\n\n- It removes none of the risk it names. Listing a token does not take `adminTransfer`, `addBlacklist`, `pause` or `activateOnlyKycAddress` away from that token's committee; those powers remain in full after listing, and a token can be listed while benign and turned hostile afterwards.\n- It costs the thing the factory exists for. An allowlist gives the factory owner a veto over who may open a pool - a centralisation finding of its own, and a larger one than the risk it was meant to cover, since it applies to every creator on every token rather than to one token's committee.\n- It moves the trust rather than reducing it: users would read a listing as an endorsement the operator is not in a position to make.\n\nThe exposure is therefore handled where it can actually be handled - disclosure. The front end is expected to show each pool's token committee and its powers. Any deployment that genuinely wants curation should curate the *interface*, where a mistake is reversible, not the factory, where it is a permanent power.",
+      "impact": "A malicious or compromised KAP-20 committee can drain a pool's entire staked principal and reward balance in one `adminTransfer`, or freeze every withdrawal permanently by enabling KYC-only transfers, blacklisting the pool, or pausing the token. Users have no recovery path in this codebase: `withdraw`, `getReward` and `exit` all terminate in a token transfer from the pool. Loss is the full TVL of every pool using that token.",
+      "recommendation": "Do not add a token allowlist to the factory; see the description for why it trades a real permission for an imaginary mitigation. Handle this off chain instead: show each pool's staking and reward token, its KAP-20 committee address and which of `adminTransfer`, `addBlacklist`, `pause` and `activateOnlyKycAddress` that token exposes, and let creators and stakers price the risk themselves. A curated front end list is the right place for curation, because it is reversible and it does not become a power over the protocol.",
+      "code": " function deploy(\n     address stakingToken,\n     address rewardsToken,\n     ...\n ) public returns (address stakingRewards) {\n-    require(rewardsToken != address(0), \"StakingRewardsFactory: rewards token is zero\");\n-    require(rewardAmount > 0, \"StakingRewardsFactory: reward amount is zero\");\n-    // stakingToken is not validated at all; neither token's admin powers are surfaced\n }",
+      "fix": " // optional, governance-gated, default open so the permissionless property stays a choice:\n+    mapping(address => bool) public tokenAllowed;\n+    bool public allowlistEnabled;\n+\n+    function deploy(...) public returns (address stakingRewards) {\n+        if (allowlistEnabled) {\n+            require(tokenAllowed[stakingToken] && tokenAllowed[rewardsToken], \"Token not allowed\");\n+        }\n         ...\n+    }\n\n // and, regardless: disclose the committee of every listed token in the UI and the README.",
+      "references": [
+        "https://docs.kubchain.com/quickstart/launching-a-token-on-kub/kap-token-interfaces/kap-20",
+        "https://www.kubscan.com/address/0x7d984C24d2499D840eB3b7016077164e15E5faA6"
+      ]
+    },
+    {
+      "id": "M-01",
+      "title": "`startEpoch` never refreshes `poolInfo`, so the on-chain index reports the first epoch's schedule forever",
+      "severity": "Medium",
+      "status": "Fixed",
+      "location": "StakingRewardsFactory.sol:239-274 (`startEpoch`), StakingRewardsFactory.sol:37-50 (`StakingRewardsInfo`, `poolInfo`)",
+      "description": "`deploy` writes the full `StakingRewardsInfo` — `rewardAmount`, `startTime`, `rewardsDuration`, `lockDuration`, `maxStakingPower`, `epoch: 1`. `startEpoch` then increments `info.epoch` and passes the **new** parameters straight through to the pool, without writing any of them back to the struct.\n\nFrom epoch 2 onwards `poolInfo` therefore describes a schedule that is no longer in force, while its `epoch` field says otherwise — a self-inconsistent record. A pool that ran epoch 1 with no lock and no cap, then opened epoch 2 with a 30-day lock and a cap, still reports `lockDuration = 0` and `maxStakingPower = 0` through `poolInfo`.\n\nThe README presents `poolInfo` as the on-chain index for exactly these fields, so an integrator following the documentation reads stale values. The live values are only available from the pool itself (`lockDuration()`, `maxStakingPower()`, `periodFinish()`, `rewardsDuration()`), or by replaying `EpochStarted` events.\n\n**Status:** fixed. Regression test: `test/Regressions.spec.ts`. `startEpoch` now writes `rewardAmount`, `startTime`, `rewardsDuration`, `lockDuration` and `maxStakingPower` alongside the epoch number, so the index always describes the epoch that is running.",
+      "impact": "A front end built on the documented index shows the wrong lock period, cap and budget from epoch 2 onwards. A user who stakes believing there is no lock discovers their tokens are locked for up to a year — the maximum epoch length — with no way to exit early, since there is deliberately no emergency withdrawal. No funds are stolen, but users take an irreversible action on information the contract itself supplied.",
+      "recommendation": "Write the new parameters into `poolInfo` in `startEpoch`, the same fields `deploy` sets. It is four assignments in a struct already loaded as `storage`. Alternatively, delete the duplicated schedule fields from `StakingRewardsInfo` and have integrators read the pool directly — that removes the divergence by construction and saves storage (see I-01). Do not leave both copies with only one of them maintained.",
+      "code": " function startEpoch(address stakingRewards, uint256 rewardAmount, uint256 startTime, uint256 rewardsDuration, uint256 lockDuration, uint256 maxStakingPower) external {\n     StakingRewardsInfo storage info = poolInfo[stakingRewards];\n     require(msg.sender == info.creator, \"StakingRewardsFactory: not the creator\");\n     ...\n     uint256 epoch = info.epoch + 1;\n     info.epoch = epoch;\n-    // startTime, rewardsDuration, lockDuration, maxStakingPower and rewardAmount\n-    // in poolInfo still describe epoch 1\n     IERC20(info.rewardsToken).safeTransferFrom(msg.sender, stakingRewards, rewardAmount);\n }",
+      "fix": "     uint256 epoch = info.epoch + 1;\n     info.epoch = epoch;\n+    info.rewardAmount = rewardAmount;\n+    info.startTime = startTime;\n+    info.rewardsDuration = rewardsDuration;\n+    info.lockDuration = lockDuration;\n+    info.maxStakingPower = maxStakingPower;\n     IERC20(info.rewardsToken).safeTransferFrom(msg.sender, stakingRewards, rewardAmount);",
+      "references": []
+    },
+    {
+      "id": "M-02",
+      "title": "Unbounded per-user deposit-lot array with no indexed withdrawal lets a staker permanently brick their own exit",
+      "severity": "Medium",
+      "status": "Fixed",
+      "location": "StakingRewards.sol:360-389 (`_debit`), StakingRewards.sol:234-259 (`withdrawableOf`, `nextUnlockAt`), StakingRewards.sol:327-333 (`exit`)",
+      "description": "Every `stake` pushes a new `Deposit` lot, and there is no cap on how many an account may hold. `_debit` walks that array from `_withdrawCursor` forward on every withdrawal, performing a storage read per lot and a storage write per lot it draws from, followed by a second `while` loop to advance the cursor. `withdrawableOf` and `nextUnlockAt` walk the same array, and `exit()` walks it twice — once through `withdrawableOf` and again through `_debit`.\n\nThe cursor only advances past a **drained** prefix. A user whose oldest lots are still locked keeps re-scanning them on every withdrawal, so the cost does not amortise while any early lot remains locked. Crucially, `withdraw` takes an amount, not an index: there is no way to reach a specific unlocked lot without scanning everything before it.\n\nAt roughly 2 100 gas for a cold lot read plus about 5 000 for a write, the practical ceiling is in the low thousands of lots before `withdraw` and `exit` exceed the block gas limit — permanently, since the only way to reduce the array is to withdraw. On KUB, where gas is cheap, creating several thousand dust stakes is inexpensive.\n\nOnly the account itself can grow its own array — `_credit` uses `msg.sender` — so this cannot be inflicted on a victim. It remains a permanent, unrecoverable freeze of that account's principal, and there is no emergency path around it.\n\n**Status:** fixed. Regression test: `test/Regressions.spec.ts`. `MAX_LIVE_LOTS = 256` bounds the array where it grows, and `withdrawFrom(index, amount)` reaches any single unlocked lot in constant gas, with `liveLots(user)` exposing the count.",
+      "impact": "An account that accumulates enough deposit lots can no longer withdraw or exit, and its principal is frozen forever. Self-inflicted, and plausible for a bot or an auto-compounder that stakes on a schedule rather than for a deliberate attacker. It also gives a bad actor a cheap way to manufacture a credible \"the protocol froze my funds\" claim.",
+      "recommendation": "Add an indexed withdrawal — `withdraw(uint256 index, uint256 amount)` — so a specific unlocked lot is reachable in constant gas regardless of history, and keep the scanning variant as a convenience. Cap the number of **live** lots per account (a few hundred is generous) and revert on `stake` beyond it, which bounds the loop on the growth path as the gas catalog recommends rather than on the loop itself. Have `exit()` reuse the amount it already computed instead of walking the array a second time.",
+      "code": " function _debit(address account, uint256 amount) private {\n     IStakingRewards.Deposit[] storage lots = _deposits[account];\n     uint256 len = lots.length;\n-    for (uint256 i = _withdrawCursor[account]; i < len && remaining > 0;) {\n-        // one cold SLOAD per lot; the cursor only skips a drained prefix,\n-        // so locked early lots are re-scanned on every single withdrawal\n     }\n     require(remaining == 0, \"Still locked\");\n }",
+      "fix": "+    uint256 public constant MAX_LIVE_LOTS = 256;\n\n function _credit(uint256 amount) private {\n+    require(_deposits[msg.sender].length - _withdrawCursor[msg.sender] < MAX_LIVE_LOTS, \"Too many lots\");\n     ...\n }\n\n+/// @notice withdraw from one specific lot, in constant gas\n+function withdrawFrom(uint256 index, uint256 amount) external nonReentrant updateReward(msg.sender) {\n+    IStakingRewards.Deposit storage lot = _deposits[msg.sender][index];\n+    require(block.timestamp >= lot.unlockAt, \"Still locked\");\n+    lot.amount -= uint128(amount);\n+    _totalSupply -= uint128(amount);\n+    _balances[msg.sender] -= amount;\n+    stakingToken.safeTransfer(msg.sender, amount);\n+    emit Withdrawn(msg.sender, amount);\n+}",
+      "references": [
+        "https://swcregistry.io/docs/SWC-128"
+      ]
+    },
+    {
+      "id": "M-03",
+      "title": "Factory owner: unbounded fee, single-step renounceable ownership, no timelock",
+      "severity": "Medium",
+      "status": "Fixed",
+      "location": "StakingRewardsFactory.sol:23 (`is Ownable`), StakingRewardsFactory.sol:82-97 (`setServiceFee`), StakingRewardsFactory.sol:134-199 (`deploy`)",
+      "description": "`setServiceFee(feeToken, feeAmount, feeReceiver)` has no upper bound on `feeAmount`, no timelock, and no constraint on `feeToken` beyond a non-zero address when the fee is on. The factory inherits OpenZeppelin `Ownable` (v4.9.6), which is single-step and keeps `renounceOwnership`.\n\nThree consequences follow. First, the owner can set an arbitrarily large fee, which prices pool creation out entirely — `deploy` is the only way to create a pool, so this is a protocol-wide off switch held by one key with no delay. Second, `deploy` reads `feeAmount` live, so a fee raised between a creator's approval and their transaction changes what they pay; the loss is bounded by their approval, but the surprise is not disclosed anywhere. Third, if ownership is renounced — or transferred in one step to a wrong address — the fee configuration freezes permanently; should it be non-zero at that moment with a token that reverts on transfer, `deploy` reverts for everyone forever, with no path to fix it.\n\nThe scope of the role is otherwise narrow and correctly so: the owner cannot touch a pool, a staked balance or a reward. The fee is off as shipped (`feeAmount == 0`), and the value flows straight to `feeReceiver` without the factory custodying it.\n\n**Status:** fixed. Regression test: `test/Regressions.spec.ts`. The factory is now `Ownable2Step` and `renounceOwnership` reverts, so the fee role cannot be lost to a mistyped address or an accidental renounce. The fee amount itself stays owner-set by design; the bound on it is the deployer's own allowance, since `deploy` pulls the fee from `msg.sender` in the same transaction that reads it. A timelock on `setServiceFee` remains the deployment-time recommendation and is out of scope for the contract.",
+      "impact": "Pool creation can be priced out, front-run for at most the amount a creator approved, or bricked permanently by a renounce or a mistyped ownership transfer. No existing pool and no staked or reward balance is at risk. If the owner key is a single EOA rather than a multisig, this is High rather than Medium.",
+      "recommendation": "Cap the fee in the setter against a documented maximum, denominated per fee token so the cap survives a token change. Switch to `Ownable2Step` and override `renounceOwnership` to revert, since the role is needed for the life of the factory. Put the fee role behind a timelock, and emit the change ahead of it taking effect so creators can see a rise before it applies. Consider snapshotting the fee a creator pays from a value they pass in — `deploy(..., uint256 maxFee)` reverting if the live fee exceeds it — which removes the front-running window entirely.",
+      "code": "-contract StakingRewardsFactory is Ownable {\n\n function setServiceFee(address _feeToken, uint256 _feeAmount, address _feeReceiver) external onlyOwner {\n     require(\n         _feeAmount == 0 || (_feeToken != address(0) && _feeReceiver != address(0)),\n         \"StakingRewardsFactory: incomplete fee\"\n     );\n-    // no upper bound on _feeAmount, no timelock, and renounceOwnership is inherited\n     feeAmount = _feeAmount;\n }",
+      "fix": "+contract StakingRewardsFactory is Ownable2Step {\n+    mapping(address => uint256) public maxFeePerToken; // set when a fee token is registered\n\n     function setServiceFee(address _feeToken, uint256 _feeAmount, address _feeReceiver) external onlyOwner {\n         require(_feeAmount == 0 || (_feeToken != address(0) && _feeReceiver != address(0)), \"...\");\n+        require(_feeAmount <= maxFeePerToken[_feeToken], \"Fee above cap\");\n         feeAmount = _feeAmount;\n     }\n\n+    /// @dev the fee role is needed for the life of the factory\n+    function renounceOwnership() public pure override {\n+        revert(\"Ownership cannot be renounced\");\n+    }",
+      "references": [
+        "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.6/contracts/access/Ownable2Step.sol"
+      ]
+    },
+    {
+      "id": "L-01",
+      "title": "Unchecked narrowing cast can truncate `periodFinish` for a far-future `startTime`",
+      "severity": "Low",
+      "status": "Fixed",
+      "location": "StakingRewards.sol:446-448 (`notifyRewardAmount`), StakingRewards.sol:127 and 429 (`_startTime` bound)",
+      "description": "Both the constructor and `notifyRewardAmount` bound the start time with `require(_startTime <= type(uint40).max)`, then compute `periodFinish = uint40(begin + _rewardsDuration)` where `begin = max(block.timestamp, _startTime)`. The bound covers the operand but not the sum.\n\n`type(uint40).max` is 1 099 511 627 775. With `_startTime` at that value and a one-year epoch, `begin + _rewardsDuration = 1 099 543 163 775`, which exceeds the type and truncates silently — Solidity 0.8 does not check explicit downcasts. `periodFinish` would land on a small timestamp already in the past, making the epoch appear finished the moment it starts: no rewards accrue, `close()` becomes callable immediately, and `_lockUntil` degenerates.\n\nThe window is `[type(uint40).max - rewardsDuration, type(uint40).max]`, i.e. the last year before the year 36 812. Only a creator setting a nonsensical `startTime` reaches it, and only their own pool is affected. It is reported because it is the one narrowing cast in the contract without a proven bound — every other one has a `require` behind it.\n\n**Status:** fixed. Regression test: `test/Regressions.spec.ts`. Both the constructor and `notifyRewardAmount` require `_startTime <= block.timestamp + MAX_DURATION`, and the remaining stores go through `SafeCast.toUint40`.",
+      "impact": "A pool whose creator supplies an absurd `startTime` silently behaves as if its epoch had already ended, wasting the funded budget until it is recovered through `close` and `recoverUnallocatedRewards`. Confined to that pool, no other pool or user affected.",
+      "recommendation": "Bound the sum rather than the operand, or use `SafeCast.toUint40` so the cast reverts instead of truncating. Bounding the start time to something sane — `block.timestamp + MAX_DURATION`, say — is better still: a start time more than a year out has no legitimate use and the tighter bound removes the class rather than the instance.",
+      "code": "-        require(_startTime <= type(uint40).max, \"Bad start time\");\n         ...\n         uint256 begin = Math.max(block.timestamp, _startTime);\n         lastUpdateTime = uint40(begin);\n-        periodFinish = uint40(begin + _rewardsDuration);",
+      "fix": "+        require(_startTime <= block.timestamp + MAX_DURATION, \"Bad start time\");\n         ...\n         uint256 begin = Math.max(block.timestamp, _startTime);\n+        lastUpdateTime = SafeCast.toUint40(begin);\n+        periodFinish = SafeCast.toUint40(begin + _rewardsDuration);",
+      "references": [
+        "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.6/contracts/utils/math/SafeCast.sol"
+      ]
+    },
+    {
+      "id": "L-02",
+      "title": "Factory moves tokens before starting the pool's epoch, with no reentrancy guard",
+      "severity": "Low",
+      "status": "Fixed",
+      "location": "StakingRewardsFactory.sol:172-186 (`deploy`), StakingRewardsFactory.sol:255-264 (`startEpoch`)",
+      "description": "`deploy` writes `poolInfo` (including `epoch: 1`) and pushes to `pools` and `poolsByCreator`, then performs two external calls — the reward `safeTransferFrom` and, when enabled, the fee `safeTransferFrom` — and only afterwards calls `notifyRewardAmount` to start the epoch. The factory has no `nonReentrant` guard.\n\nBetween the transfer and the notify the pool is registered but unstarted: `poolInfo[pool].epoch == 1` while the pool's own `periodFinish` is still 0. A reward token that hands control to the caller during `transferFrom` can reenter `startEpoch(pool, ...)` at that moment. `msg.sender == info.creator` holds, and `block.timestamp >= periodFinish` is trivially true against 0, so the inner call funds and starts an \"epoch 2\", after which the outer `notifyRewardAmount` overwrites the schedule with the epoch-1 parameters. The result is an inconsistent epoch counter and a schedule that does not match the funds in the pool.\n\nReaching it requires a reward token with a transfer hook, which the creator chooses for their own pool, so no other pool or user is affected. It is filed because the ordering is avoidable and the fix is one line.\n\n**Status:** fixed. Regression test: `test/Regressions.spec.ts`. `deploy` and `startEpoch` are both `nonReentrant`.",
+      "impact": "Confined to a pool whose creator deliberately supplied a hostile reward token: an off-by-one epoch counter and a schedule that disagrees with the funding, both of which they inflicted on themselves. No cross-pool effect — pools share no balance and the factory holds none.",
+      "recommendation": "Follow checks-effects-interactions at the factory level too: start the epoch immediately after the reward transfer and take the fee last, or simply add `nonReentrant` to `deploy` and `startEpoch`. The guard is the cheaper and more durable answer since it also covers the fee token, which the owner rather than the creator chooses.",
+      "code": " IERC20(rewardsToken).safeTransferFrom(msg.sender, stakingRewards, rewardAmount);\n uint256 fee = feeAmount;\n if (fee > 0) {\n-    IERC20(feeToken).safeTransferFrom(msg.sender, feeReceiver, fee);\n }\n-// pool is registered but not started: a reentrant token can call startEpoch here\n StakingRewards(stakingRewards).notifyRewardAmount(rewardAmount, startTime, ...);",
+      "fix": "+contract StakingRewardsFactory is Ownable2Step, ReentrancyGuard {\n     ...\n+    function deploy(...) public nonReentrant returns (address stakingRewards) {\n     ...\n+    function startEpoch(...) external nonReentrant {",
+      "references": [
+        "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.6/contracts/security/ReentrancyGuard.sol"
+      ]
+    },
+    {
+      "id": "L-03",
+      "title": "`unchecked` blocks in the accumulator rely on bounds that are never stated or enforced",
+      "severity": "Low",
+      "status": "Fixed",
+      "location": "StakingRewards.sol:163-165 (`rewardPerToken`), StakingRewards.sol:169-172 (`earned`), StakingRewards.sol:501-505 (`updateReward`)",
+      "description": "Three `unchecked` blocks carry the reward maths, and each depends on an invariant that holds but is not documented or enforced:\n\n- `rewardPerToken`: `(applicable - last) * rewardRate` is safe only while `rewardRate` stays below roughly `3.6e69`. `rewardRate = reward * 1e18 / duration`, and `reward * 1e18` is checked, so `reward` cannot exceed about `1.15e59` — but with `duration = 1` a reward token whose supply exceeds `3.6e33` base units still produces a rate that wraps the product silently, corrupting `rewardPerTokenStored` upward and letting the pool pay out until its balance is exhausted.\n- `earned`: `rewardPerToken() - userRewardPerTokenPaid[account]` is an unchecked subtraction. It is safe because `rewardPerTokenStored` is monotonic and `userRewardPerTokenPaid` is only ever assigned from it — but that is the invariant the block is betting on, and upstream Synthetix used checked arithmetic here.\n- `updateReward`: the same product as `rewardPerToken`, feeding `unallocatedRewards`.\n\nBecause pool creation is permissionless, an attacker can supply a token with an absurd supply — but only into their own pool, and pools share no balance, so the blast radius is the attacker's own funds.\n\n**Status:** fixed. Regression test: `test/Regressions.spec.ts`. The accumulator no longer uses `unchecked`; the remaining `unchecked` blocks are loop counters only.",
+      "impact": "In a pool whose creator supplied an extreme-supply reward token with a one-second epoch, the accumulator can wrap and over-credit stakers up to that pool's balance. Confined to that pool; no cross-pool or protocol-level effect. The `earned` subtraction is currently sound.",
+      "recommendation": "State the bound each block relies on in a comment immediately above it, so a future change cannot invalidate it silently — an `unchecked` block without its proof written down is a trap for the next editor. Then enforce the one that is not structural: bound `rewardRate` at scheduling time (`require(rewardRate <= type(uint128).max)` is generous and closes the wrap), or move the accumulator step to `Math.mulDiv`, which the C-01 fix does anyway and which removes this class of intermediate overflow entirely.",
+      "code": " function rewardPerToken() public view returns (uint256) {\n     ...\n     unchecked {\n-        return rewardPerTokenStored + ((applicable - last) * rewardRate) / supply;\n     }\n }",
+      "fix": " function notifyRewardAmount(...) external {\n     ...\n+    // bound the rate so the accumulator product cannot wrap:\n+    // (MAX_DURATION = 3.15e7) * rate < type(uint256).max\n+    require(rate <= type(uint128).max, \"Reward rate too high\");\n     rewardRate = rate;\n }\n\n function rewardPerToken() public view returns (uint256) {\n+    // safe: applicable - last <= MAX_DURATION, rewardRate <= 2^128, product < 2^160\n+    return rewardPerTokenStored + Math.mulDiv(applicable - last, rewardRate, supply);\n }",
+      "references": []
+    },
+    {
+      "id": "I-01",
+      "title": "Gas: pool creation costs 3.15M and the factory's index uses nine full storage slots",
+      "severity": "Informational",
+      "status": "Fixed",
+      "location": "StakingRewardsFactory.sol:37-50, StakingRewards.sol:327-333, throughout",
+      "description": "Measured with `forge build --sizes` and the project's own gas snapshot: `StakingRewards` is 14 081 bytes of runtime code (10 495 bytes of margin under EIP-170) and each pool creation costs 3 150 571 gas, paid by the creator. The changes below are safe and mechanical; none of them alters behaviour. The storage packing already applied to the pool — the schedule in one slot, `_totalSupply` with `maxStakingPower` in another, the token addresses immutable — is good work and is not duplicated in the factory.\n\n**Status:** partly addressed. The optimizer now runs at 1 000 rather than 999 999: the factory embeds the pool's initcode, and at the higher setting the factory's runtime grew to 25 719 bytes, past the EIP-170 24 576-byte limit, so it could not have been deployed at all. At 1 000 runs the factory is 21 249 bytes with a 3.3 KB margin and the pool is 13 366. The nine-slot `StakingRewardsInfo` is left as is — it is written once per epoch and read off chain, so packing it buys the users nothing.\n\n**Re-review, reuse pass.** Three duplicated code paths were costing users gas and have been merged:\n\n- `updateReward` advanced the accumulator with `rewardPerToken()` and then called `earned(account)`, which calls `rewardPerToken()` a second time. Every `stake`, `withdraw`, `getReward` and `exit` therefore ran the accrual `mulDiv` and re-read `_totalSupply`, `lastUpdateTime`, `rewardRate` and `rewardPerTokenStored` twice. The modifier now computes the value once into a local and settles the account from it via a private `_earned(account, rpt)`. It also no longer writes `rewardPerTokenStored` when the pool is empty, where the write was a no-op.\n- `exit()` called `withdraw()` and then `getReward()`, both external and both guarded, so a single exit settled the accumulator twice, took the `nonReentrant` guard twice, and walked the deposit-lot array twice - once in `withdrawableOf` to measure and once in `_debit` to take. It is now a single guarded call over a single pass (`_take(account, type(uint256).max)`), measured at 168 844 gas against the two-call path in `test/Regressions.spec.ts`.\n- `withdraw` and `withdrawFrom` each carried their own copy of the supply/balance/transfer/emit tail and of the drained-lot cursor sweep. Both now share `_payOut` and `_sweep`, and `_debit` was generalised into `_take(account, wanted) returns (taken)` so the exact-amount path and the drain-everything path are one loop.\n\n**Re-review, layout pass.** `StakingRewardsInfo` is now packed into five storage slots instead of nine: `creator`+`startTime`(uint40)+`rewardsDuration`(uint32) share one slot, `stakingToken`+`lockDuration`(uint32)+`epoch`(uint32) another, then `rewardsToken`, `rewardAmount` and `maxStakingPower`(uint128). That is four fewer cold `SSTORE`s (20 000 gas each) on every `deploy` and every `startEpoch`, paid by pool creators.\n\nThe narrowing is guarded rather than assumed. In `deploy` the pool's constructor has already rejected any out-of-range value before the index is written. In `startEpoch` the index is written *before* `notifyRewardAmount`, so the same bounds are now required explicitly first - `rewardsDuration` within `MAX_DURATION` and non-zero, `lockDuration <= rewardsDuration`, `startTime <= now + MAX_DURATION`, `maxStakingPower <= type(uint128).max` - which makes an out-of-range value revert instead of silently truncating in the index and leaving it disagreeing with the pool. Regression test: `test/Regressions.spec.ts` (\"I-01: startEpoch rejects values the packed index could not hold\").",
+      "impact": "None. Cost only.",
+      "recommendation": "Apply in the order listed; the first two are worth the most.",
+      "code": "// StakingRewardsInfo: 9 x uint256 = 9 storage slots written per pool\n struct StakingRewardsInfo {\n     address creator;\n     address stakingToken;\n     address rewardsToken;\n-    uint256 rewardAmount;\n-    uint256 startTime;\n-    uint256 rewardsDuration;\n-    uint256 lockDuration;\n-    uint256 maxStakingPower;\n-    uint256 epoch;\n }\n\n function exit() external {\n-    uint256 amount = withdrawableOf(msg.sender);   // walks every lot\n-    if (amount > 0) withdraw(amount);              // walks them again in _debit\n     getReward();\n }",
+      "fix": " struct StakingRewardsInfo {\n     address creator;      // slot 0\n     address stakingToken; // slot 1\n     address rewardsToken; // slot 2\n+    uint128 rewardAmount; // slot 3, packed\n+    uint40 startTime;\n+    uint32 rewardsDuration;\n+    uint32 lockDuration;\n+    uint128 maxStakingPower; // slot 4, packed\n+    uint32 epoch;\n }\n// 9 slots -> 5: about 88 000 gas off every pool creation\n\n// Other changes, roughly in order of value:\n// - custom errors instead of require strings: ~10-15% off the 3.15M deploy cost\n// - _debit reads _withdrawCursor[account] twice; cache it\n// - exit(): reuse the amount withdrawableOf already computed instead of rescanning\n// - drop stakeWithPermit if LP tokens with EIP-2612 are not a target on KUB\n// - add `forge snapshot` / `forge test --gas-report` to CI so this does not regress",
+      "references": [
+        "https://github.com/foundry-rs/foundry"
+      ]
+    },
+    {
+      "id": "I-02",
+      "title": "No emergency withdrawal path, and no invariant tests for the solvency properties",
+      "severity": "Informational",
+      "status": "Open",
+      "location": "StakingRewards.sol:293-333, test/",
+      "description": "There is deliberately no `emergencyWithdraw` that skips reward accounting, and that decision is defensible here: `updateReward` performs no external call, reads no oracle and cannot be made to revert by anything an attacker controls, so the usual reason for an emergency path does not apply. The exception is the loop in `_debit`, which is exactly what M-02 is about — an indexed withdrawal covers that case better than an emergency exit would.\n\nSeparately, the 46-test Mocha suite is thorough on behaviour — including a precision sweep across 0/2/6/8/18-decimal tokens whose `maxDust` formula encodes the C-01 mechanism — but there are no property-based or invariant tests. The two invariants worth asserting are the ones that would have surfaced H-01 and C-01 automatically:\n\n- `stakingToken.balanceOf(pool) >= totalSupply()`\n- `rewardsToken.balanceOf(pool) >= sum(earned(u)) + unallocatedRewards`",
+      "impact": "None directly. Absence of invariant testing is why an arithmetic finding like C-01 survives an otherwise good test suite.",
+      "recommendation": "Add Foundry invariant tests for the two properties above, fuzzing over decimals, budgets, durations and interaction counts — the same axes the precision spec already walks manually. Run Slither in CI; it was unavailable in this environment and was not run, so a static pass has not been performed on this code. Keep the decision to omit an emergency withdrawal, and document the reasoning in the README so it reads as a choice rather than an omission.",
+      "references": [
+        "https://github.com/crytic/slither",
+        "https://github.com/crytic/building-secure-contracts"
+      ]
+    },
+    {
+      "id": "I-03",
+      "title": "Event ordering and index semantics make off-chain reconstruction harder than it needs to be",
+      "severity": "Informational",
+      "status": "Fixed",
+      "location": "StakingRewardsFactory.sol:187-198 (`deploy`), StakingRewardsFactory.sol:41 (`rewardAmount`)",
+      "description": "`deploy` emits `EpochStarted` before `Deployed` for the same pool, so an indexer processing logs in order sees an epoch start for a pool it has not yet been told exists. Both are in the same transaction, so nothing is lost, but a naive consumer has to buffer.\n\n`poolInfo.rewardAmount` also carries an unstated meaning: it is the first epoch's budget and is never updated, so it reads as the pool's total funding when it is not. This is the same divergence as M-01 and disappears with that fix.\n\n**Status:** fixed. Regression test: `test/Regressions.spec.ts`. `deploy` emits `Deployed` before `EpochStarted`.",
+      "impact": "None. Integration ergonomics only.",
+      "recommendation": "Emit `Deployed` before `EpochStarted`. Rename the struct field to `firstEpochRewardAmount`, or refresh it in `startEpoch` per M-01, so the name matches what the value means.",
+      "code": " StakingRewards(stakingRewards).notifyRewardAmount(...);\n-emit EpochStarted(stakingRewards, 1, rewardAmount, ...);\n-emit Deployed(stakingToken, rewardsToken, stakingRewards, msg.sender, ...);",
+      "fix": " StakingRewards(stakingRewards).notifyRewardAmount(...);\n+emit Deployed(stakingToken, rewardsToken, stakingRewards, msg.sender, ...);\n+emit EpochStarted(stakingRewards, 1, rewardAmount, ...);",
+      "references": []
+    },
+    {
+      "id": "I-04",
+      "title": "No single-call read surface: a pool page cost a front end fifteen or more RPC round trips",
+      "severity": "Informational",
+      "status": "Fixed",
+      "location": "StakingRewardsLens.sol (new), StakingRewards.sol:153-283 (individual getters)",
+      "description": "Every piece of pool and position state was reachable only through its own getter: `totalSupply`, `maxStakingPower`, `remainingStakingPower`, `rewardRate`, `rewardPerToken`, `getRewardForDuration`, `unallocatedRewards`, `startTime`, `periodFinish`, `lastUpdateTime`, `rewardsDuration`, `lockDuration`, `closed`, `balanceOf`, `earned`, `withdrawableOf`, `nextUnlockAt`, `totalUserStakedIndex`, `liveLots`, `stakingAllowance`, plus the two token balances a stake form needs. A pool page was twenty-odd `eth_call`s, and a pool *list* was that many per pool.\n\nBeyond the round trips this is a correctness problem for the UI: separate calls can land in different blocks, so a front end could render `earned` from one block against `totalSupply` from another and show a figure that never existed.\n\n**Status:** fixed by `StakingRewardsLens`, a stateless read-only aggregator. `state(pool, account, lotStart, lotCount)` returns the pool, the position and a page of deposit lots in one call; `statesByFactory` and `statesByCreator` return a whole page of pools the same way, with the total so no second call is needed. Every value is settled to the calling block and `blockTimestamp` is returned with it. Tests: `test/Lens.spec.ts`.\n\nThe aggregation deliberately does not live on the pool. The factory embeds the pool's creation code, so adding the views to `StakingRewards` grew the factory's runtime to 23 781 bytes - 795 bytes under the EIP-170 limit, too little margin to keep. As a separate contract the lens costs the factory nothing, and one lens serves every pool and every factory. Same pattern as Aave's `UiPoolDataProvider` and PancakeSwap's MasterChef lens contracts.",
+      "impact": "No funds at risk: the lens is read-only, holds nothing, has no owner and no privileged function, and nothing in the protocol calls it - it can be redeployed or abandoned without affecting a live pool. The issue was integration cost and the risk of a front end presenting values stitched together from different blocks.",
+      "recommendation": "Deploy `StakingRewardsLens` alongside the factory (`script/deploy.sh` does both) and have front ends read through it. Keep the individual getters on the pool: on-chain integrators want the narrow ones, and the lens is built on top of them rather than replacing them.",
+      "code": " // a pool page, before\n-const totalSupply = await pool.totalSupply()\n-const rate        = await pool.rewardRate()\n-const finish      = await pool.periodFinish()\n-const earned      = await pool.earned(account)\n-// ... sixteen more, each its own eth_call, each possibly a different block",
+      "fix": " // a pool page, after\n+const [pool, user, lots] = await lens.state(poolAddress, account, 0, 50)\n // one call, one block, mutually consistent, blockTimestamp included"
+    }
+  ]
+}

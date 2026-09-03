@@ -10,9 +10,17 @@ case "${1:-}" in
   *) echo "usage: $0 testnet|mainnet" >&2; exit 1 ;;
 esac
 
-: "${PRIVATE_KEY:?}" "${REWARDS_TOKEN:?}" "${STAKING_REWARDS_GENESIS:?}"
+: "${PRIVATE_KEY:?}"
 
-forge create contracts/StakingRewardsFactory.sol:StakingRewardsFactory \
-  --rpc-url "$RPC" --chain "$CHAIN" --private-key "$PRIVATE_KEY" --broadcast \
-  --constructor-args "$REWARDS_TOKEN" "$STAKING_REWARDS_GENESIS" \
-  --verify --verifier blockscout --verifier-url "$VERIFIER_URL"
+deploy() {
+  forge create "$1" \
+    --rpc-url "$RPC" --chain "$CHAIN" --private-key "$PRIVATE_KEY" --broadcast \
+    --verify --verifier blockscout --verifier-url "$VERIFIER_URL"
+}
+
+# the factory: the only contract the protocol depends on
+deploy contracts/StakingRewardsFactory.sol:StakingRewardsFactory
+
+# the lens: read-only aggregator for front ends. Holds nothing, is never called by the
+# factory or a pool, and can be redeployed or replaced without touching a live pool.
+deploy contracts/StakingRewardsLens.sol:StakingRewardsLens

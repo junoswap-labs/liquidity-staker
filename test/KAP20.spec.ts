@@ -17,7 +17,7 @@ describe('stakingAllowance', () => {
   const amount = expandTo18Decimals(7)
 
   async function staker(stakingToken: Contract) {
-    return deployContract(wallet, StakingRewards, [wallet.address, stakingToken.address, stakingToken.address])
+    return deployContract(wallet, StakingRewards, [wallet.address, stakingToken.address, stakingToken.address, wallet.address, 0, 60 * 60 * 24 * 60, 0, 0])
   }
 
   it('reads ERC20 allowance()', async () => {

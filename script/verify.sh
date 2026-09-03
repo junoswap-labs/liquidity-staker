@@ -12,8 +12,8 @@ case "$NET" in
   *) echo "usage: $0 testnet|mainnet <address> [target] [ctor-args]" >&2; exit 1 ;;
 esac
 
-ARGS=${4:-$(cast abi-encode "c(address,uint256)" "$REWARDS_TOKEN" "$STAKING_REWARDS_GENESIS")}
+ARGS=${4:-}
 
 forge verify-contract "$ADDR" "$TARGET" \
   --chain "$CHAIN" --verifier blockscout --verifier-url "$VERIFIER_URL" \
-  --constructor-args "$ARGS" --watch
+  ${ARGS:+--constructor-args "$ARGS"} --watch
