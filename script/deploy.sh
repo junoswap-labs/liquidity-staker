@@ -14,7 +14,7 @@ esac
 
 deploy() {
   forge create "$1" \
-    --rpc-url "$RPC" --chain "$CHAIN" --private-key "$PRIVATE_KEY" --broadcast \
+    --rpc-url "$RPC" --chain "$CHAIN" --private-key "$PRIVATE_KEY" --broadcast --legacy \
     --verify --verifier blockscout --verifier-url "$VERIFIER_URL"
 }
 
